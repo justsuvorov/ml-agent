@@ -10,6 +10,9 @@
     report = agent.run()
     report  # HTML-отчёт в ячейке
 """
+import contextlib
+import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -52,9 +55,24 @@ class MLAgent:
         self.run_dir: Optional[Path] = None
         self.report: Optional[AgentReport] = None
 
+    @contextlib.contextmanager
+    def _in_project_dir(self):
+        """casco-код работает с путями от текущего каталога (temp_dataset.gzip, model_configs/, prod_models/,
+        casco_fl_feature_catalog.json), поэтому на время работы агента cwd = корень проекта."""
+        previous = Path.cwd()
+        os.chdir(self.task.base_dir)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
     # ---------- проверка ----------
     def dry_run(self) -> dict:
         """Проверка без обучения: размер данных, план сегментов, колонки конфига, которых нет в данных."""
+        with self._in_project_dir():
+            return self._dry_run()
+
+    def _dry_run(self) -> dict:
         df = load_dataset(self.task)
         editor = ModelsConfigEditor.from_file(self.task.resolve(self.task.automl['models_config']))
         column = self.task.data['segment_column']
@@ -77,6 +95,10 @@ class MLAgent:
     # ---------- запуск ----------
     def run(self, send_mail: bool = None) -> AgentReport:
         """Полный цикл. ``send_mail`` переопределяет ``[email] send`` задания."""
+        with self._in_project_dir():
+            return self._run(send_mail)
+
+    def _run(self, send_mail: bool = None) -> AgentReport:
         self.run_dir = self.task.resolve(self.task.agent.get('workdir', 'agent_runs')) / \
             f'{datetime.now():%Y%m%d_%H%M%S}_{self.task.name}'
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +109,7 @@ class MLAgent:
             logger.info(f'AGENT||Задание {self.task.name}, сценарий {self.task.scenario}, директория {self.run_dir}')
             llm = build_llm_client(self.config, overrides=self.task.llm, log_path=self.run_dir / 'llm_log.jsonl')
             run_config = self._run_config()
+            self._prepare_auto_ml_config()
             runner = ExperimentRunner(self.task, llm, self.run_dir, run_config)
             try:
                 SCENARIOS[self.task.scenario](self.task, runner)
@@ -107,6 +130,24 @@ class MLAgent:
             return self.report
         finally:
             logger.remove(log_id)
+
+    def _prepare_auto_ml_config(self):
+        """Копия AutoML-конфига с отдельным MLflow-экспериментом (``[automl] mlflow_experiment``),
+        чтобы прогоны агента не попадали в продовый эксперимент (CascoMLFLow логирует в
+        ``auto_ml_config.mlflow_experiment``)."""
+        experiment = self.task.automl.get('mlflow_experiment')
+        if not experiment:
+            return
+        original = self.task.automl.setdefault('auto_ml_config_source', self.task.automl['auto_ml_config'])
+        source = self.task.resolve(original)
+        with open(source, encoding='utf-8') as f:
+            auto_ml_config = json.load(f)
+        auto_ml_config['mlflow_experiment'] = experiment
+        target = self.run_dir / f'auto_ml_config_{source.stem}.json'
+        with open(target, 'w', encoding='utf-8') as f:
+            json.dump(auto_ml_config, f, ensure_ascii=False, indent=4)
+        self.task.automl['auto_ml_config'] = str(target)
+        logger.info(f'AGENT||MLflow-эксперимент агента: {experiment}')
 
     def send(self, receivers: list = None) -> None:
         """Отправить последний отчёт письмом (например, после просмотра в ноутбуке)."""
