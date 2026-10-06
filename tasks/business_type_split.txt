@@ -1,0 +1,81 @@
+# Задание агенту: проверить, дают ли отдельные модели по BUSINESS_TYPE прирост качества.
+# Пути — относительно корня проекта casco (MLAgent(project_dir=...)), где лежат config.py, casco_automl.py, model_configs/.
+# Значения: true/false, числа, JSON ({...}/[...]), остальное — строки.
+# Настройки LLM, SMTP и пути — в config.py проекта, здесь только постановка задачи.
+
+[task]
+name = business_type_split
+scenario = segment_split
+description = Проверка гипотезы: обучение моделей частоты КАСКО (б/у ТС) отдельно по каждому значению BUSINESS_TYPE против единой модели.
+
+[data]
+source_file = temp_dataset_main_fit.gzip
+preprocess_hook = ml_agent.hooks:casco_business_type
+base_query = VEHICLE_NEW == 0
+segment_column = BUSINESS_TYPE
+# auto — все значения поля; либо список через запятую: НОВЫЙ, ПРОЛОНГАЦИЯ, ПЕРЕХОД
+segment_values = auto
+min_rows = 20000
+# малые сегменты (< min_rows) обучить одной общей моделью __OTHER__
+group_small_segments = true
+include_baseline = true
+# файл, который читают casco-скрипты (local_name_source в конфиге); агент также сам подставляет путь в копию конфига
+temp_dataset = temp_dataset.gzip
+
+[automl]
+class = casco_automl:CascoFLAutoML
+auto_ml_config = model_configs/automl-casco-fl.json
+models_config = model_configs/kasko_fl_frequency_old_cars_new_features.json
+retro = false
+hp_tune = false
+extra_kwargs = {"business_metric": null, "use_temp_files": false, "severity_model_name": null, "model_to_compare": "prod_models/sweetie_fox_old_cars_frequency.pickle", "features_for_plot": []}
+# метод automl-объекта, вызываемый после update_models (как в main_fit)
+post_hook = casco_results
+
+[evaluation]
+main_metric = rmse
+direction = minimize
+min_improvement = 0.0005
+# baseline — эталон = исходная модель, обученная агентом на всех данных; обе модели оцениваются
+#            на одних и тех же тестовых строках сегмента;
+# automl   — штатное сравнение класса (prod-пикл из model_to_compare).
+# baseline_compare_kwarg — дополнительно передать пикл baseline в этот kwarg automl-класса
+compare_with = baseline
+baseline_compare_kwarg = model_to_compare
+# своё сравнение, например обёртка над compare_models.compare_models: функция(experiments, task) -> DataFrame
+# compare_hook = my_hooks:casco_compare
+
+[agent]
+workdir = agent_runs
+max_fix_attempts = 3
+drop_missing_features = true
+allow_llm_abort = false
+isolate_results = true
+
+[llm]
+# по умолчанию config.llm_model_type; offline — без внешней LLM (отладка)
+# model_type = offline
+
+[external_config]
+# переопределения атрибутов config.py только для этого задания, например:
+# mlflow_experiment = agent_business_type
+
+[email]
+send = true
+subject = ML-агент: разделение моделей КАСКО по BUSINESS_TYPE
+# если не задано — config.email_receivers
+# receivers = analyst@vsk.ru, head@vsk.ru
+class = mldataworker.core.email:EMail
+
+[instructions]
+Проверь, стоит ли обучать отдельные модели частоты для каждого типа бизнеса (BUSINESS_TYPE)
+вместо единой модели по всему портфелю б/у ТС.
+
+При оценке учитывай:
+- прирост основной метрики на тестовой выборке сегмента относительно эталонной модели;
+- размер сегмента: на малых сегментах прирост может быть шумом;
+- какие правки конфигурации пришлось внести агенту и не искажают ли они сравнение;
+- если отдельная модель лучше только на части сегментов — предложи гибрид
+  (отдельные модели для крупных сегментов, общая — для остальных).
+
+В рекомендации явно напиши: внедрять разделение или нет, и для каких сегментов.
