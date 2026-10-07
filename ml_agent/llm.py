@@ -301,31 +301,37 @@ class LLMClient:
 
 
 def offline_answer(kind: str, context: dict) -> dict:
-    """Детерминированные ответы без LLM: правок не предлагает, отчёт строит по дельтам метрик."""
+    """Детерминированные ответы без LLM: правок не предлагает, отчёт строит по формальному сравнению."""
     if kind == 'fix_config':
         return {'diagnosis': 'offline-режим: LLM не подключена, автоматических правок нет',
                 'action': 'skip', 'patches': []}
     if kind != 'report':
         return {}
     threshold = context.get('min_improvement') or 0
-    segments = []
-    for row in context.get('comparison', []):
-        delta = row.get('improvement')
-        if delta is None:
-            verdict = 'unknown'
-        elif delta > threshold:
-            verdict = 'better'
-        elif delta < -threshold:
-            verdict = 'worse'
-        else:
-            verdict = 'neutral'
-        segments.append({'segment': row.get('experiment'), 'model': row.get('model'), 'verdict': verdict,
-                         'comment': f"{row.get('metric')}: {row.get('new_value')} против {row.get('reference_value')}"})
-    better = sorted({str(s['segment']) for s in segments if s['verdict'] == 'better'})
-    recommendation = ('Отдельные модели дают прирост для сегментов: ' + ', '.join(better)) if better else \
-        'Разделение не даёт прироста относительно эталона — оставить единую модель.'
+    key = context.get('business_key')
+    business = [r for r in context.get('business') or [] if key and r.get(key) is not None]
+    groups = []
+    if business:  # лучшая комбинация в каждой группе по бизнес-метрике
+        for group in dict.fromkeys(r['group'] for r in business):
+            best = max((r for r in business if r['group'] == group), key=lambda r: r[key])
+            better = best[key] > threshold
+            groups.append({'group': group, 'best_combination': best['combination'] if better else 'все общие',
+                           'verdict': 'better' if better else 'neutral',
+                           'comment': f"{key}: {best[key]} ({best['combination']})"})
+    else:  # без бизнес-метрики — по статистической метрике отдельных моделей
+        for row in context.get('comparison', []):
+            if row.get('group') == '__ALL__':  # общая модель — эталон, не сравнивается
+                continue
+            delta = row.get('improvement')
+            verdict = 'unknown' if delta is None else 'better' if delta > threshold else                 'worse' if delta < -threshold else 'neutral'
+            groups.append({'group': f"{row.get('block')}: {row.get('group')}", 'best_combination': '-',
+                           'verdict': verdict,
+                           'comment': f"{row.get('model')} {row.get('metric')}: "
+                                      f"{row.get('new_value')} против {row.get('reference_value')}"})
+    better = [g['group'] for g in groups if g['verdict'] == 'better']
+    recommendation = ('Отдельные модели дают прирост для: ' + ', '.join(map(str, better))) if better else         'Разделение не даёт прироста относительно общих моделей — оставить общие.'
     return {'summary': 'Отчёт сформирован в offline-режиме (без LLM) по формальному сравнению метрик.',
-            'segments': segments, 'recommendation': recommendation,
+            'groups': groups, 'recommendation': recommendation,
             'risks': ['Вывод сделан без интерпретации LLM.'], 'next_steps': []}
 
 

@@ -1,55 +1,74 @@
-# Задание агенту: проверить, дают ли отдельные модели по BUSINESS_TYPE прирост качества.
+# Задание агенту: разделение моделей КАСКО ФЛ (б/у ТС) по типу бизнеса.
 # Пути — относительно корня проекта casco (MLAgent(project_dir=...)), где лежат config.py, casco_automl.py, model_configs/.
 # Значения: true/false, числа, JSON ({...}/[...]), остальное — строки.
 # Настройки LLM, SMTP и пути — в config.py проекта, здесь только постановка задачи.
 
 [task]
 name = business_type_split
-scenario = segment_split
-description = Проверка гипотезы: обучение моделей частоты КАСКО (б/у ТС) отдельно по каждому значению BUSINESS_TYPE против единой модели.
+scenario = factor_split
+description = Проверка гипотезы: модели частоты и тяжести/тоталя КАСКО ФЛ (б/у ТС), обученные отдельно по типу бизнеса, против общих моделей; критерий — фин. эффект (Margin).
 
 [data]
 source_file = temp_dataset_main_fit.gzip
 preprocess_hook = ml_agent.hooks:casco_business_type
-base_query = VEHICLE_NEW == 0
-# колонку создаёт preprocess_hook: BUSINESS_TYPE_NEW в верхнем регистре, как в main_fit/compare_models
+# фактор и группы: колонку создаёт preprocess_hook (BUSINESS_TYPE_NEW в верхнем регистре, как в compare_models)
 segment_column = AGENT_BUSINESS_TYPE
-# б/у ТС (VEHICLE_NEW == 0) в compare_models — это три типа бизнеса; auto — все значения поля
 segment_values = ПРОЛОНГАЦИЯ, Б/У ТС ПЕРЕХОД, Б/У ТС ИНОЕ
+# область гипотезы: здесь считаются размеры групп и фин. эффект; это же фильтр обучения по умолчанию для блоков
+base_query = VEHICLE_NEW == 0
 min_rows = 20000
-# малые сегменты (< min_rows) обучить одной общей моделью __OTHER__
+# малые группы (< min_rows) обучить одной общей моделью __OTHER__
 group_small_segments = true
-include_baseline = true
-# CascoFLAutoML при создании читает temp_dataset.gzip (FactorPlots — графики факторов), поэтому агент
-# перед каждым экспериментом пишет туда данные сегмента, как main_fit; для обучения путь подставляется в копию конфига
+# CascoFLAutoML при создании читает temp_dataset.gzip (FactorPlots), поэтому агент перед каждым обучением
+# пишет туда данные эксперимента, как main_fit; для обучения путь подставляется в копию конфига
 temp_dataset = temp_dataset.gzip
 
 [automl]
+# общие настройки всех блоков
 class = casco_automl:CascoFLAutoML
 auto_ml_config = model_configs/automl-casco-fl.json
-models_config = model_configs/kasko_fl_frequency_old_cars_new_features.json
 retro = false
 hp_tune = false
 # отдельный MLflow-эксперимент для прогонов агента (иначе — продовый из auto_ml_config)
 mlflow_experiment = KaskoFLAgent
-extra_kwargs = {"business_metric": null, "use_temp_files": false, "severity_model_name": null, "model_to_compare": "prod_models/sweetie_fox_old_cars_frequency.pickle", "features_for_plot": []}
-# метод automl-объекта после update_models (как в main_fit): коэффициенты GLM в xlsx и графики факторов
-# в results запуска, но ещё и запись в общий casco_fl_feature_catalog.json — отключите, если каталог
-# не должен пополняться экспериментами агента
+extra_kwargs = {"business_metric": null, "use_temp_files": false, "severity_model_name": null, "features_for_plot": []}
+# после update_models (как в main_fit): коэффициенты GLM в xlsx и графики факторов в results запуска,
+# но ещё и запись в общий casco_fl_feature_catalog.json — закомментируйте, если каталог не должен пополняться
 post_hook = casco_results
 
+# Блоки моделей: каждый — общая модель + модель на каждой группе. Ключи, которые не являются
+# настройками запуска (например model_to_compare), передаются в CascoFLAutoML.
+
+[block.frequency]
+models_config = model_configs/kasko_fl_frequency_old_cars_new_features.json
+model_to_compare = prod_models/sweetie_fox_old_cars_frequency.pickle
+# base_query не задан -> [data] base_query (VEHICLE_NEW == 0), как в main_fit
+
+[block.severity_total]
+models_config = model_configs/kasko_fl_severity_total.json
+model_to_compare = prod_models/sweetie_fox_severity_total.pickle
+# пусто -> без фильтра: общая модель тяжести/тоталя учится на всех данных, как в main_fit;
+# модели групп — на строках группы
+base_query =
+
 [evaluation]
+# Фин. эффект комбинаций (частота: общая/группа) × (тяжесть+тоталь: общая/группа) против «все общие»
+business_metric = business_metric:FinEffectMetric
+business_metric_kwargs = {}
+business_metric_key = Margin
+compare_function = mldataworker.automl:compare_pickle_models
+extra_columns = GLM_INTERVAL_PREMIUM, SUM_INSURED
+models_order = frequency, severity, total
+no_exposure_models = severity
+min_improvement = 0
+# доп. фильтр строк оценки, например как в compare_models:
+# query = POLICY_PRODUCT == 'КЛАССИКА'
+
+# Статистические метрики отдельных моделей (модель группы против общей модели блока на тех же строках)
 main_metric = rmse
 direction = minimize
-min_improvement = 0.0005
-# baseline — эталон = исходная модель, обученная агентом на всех данных; обе модели оцениваются
-#            на одних и тех же тестовых строках сегмента;
-# automl   — штатное сравнение класса (prod-пикл из model_to_compare).
-# baseline_compare_kwarg — дополнительно передать пикл baseline в этот kwarg automl-класса
-compare_with = baseline
+# штатное сравнение CascoFLAutoML у моделей групп — с общей моделью блока, а не с прод-пиклом
 baseline_compare_kwarg = model_to_compare
-# своё сравнение, например обёртка над compare_models.compare_models: функция(experiments, task) -> DataFrame
-# compare_hook = my_hooks:casco_compare
 
 [agent]
 workdir = agent_runs
@@ -63,25 +82,27 @@ isolate_results = true
 # model_type = offline
 
 [external_config]
-# переопределения атрибутов config.py только для этого задания, например:
-# mlflow_experiment = agent_business_type
+# переопределения атрибутов config.py только для этого задания
 
 [email]
 send = true
-subject = ML-агент: разделение моделей КАСКО по BUSINESS_TYPE
+subject = ML-агент: разделение моделей КАСКО ФЛ по типу бизнеса
 # если не задано — config.email_receivers
 # receivers = analyst@vsk.ru, head@vsk.ru
 class = mldataworker.core.email:EMail
 
 [instructions]
-Проверь, стоит ли обучать отдельные модели частоты для каждого типа бизнеса (BUSINESS_TYPE)
-вместо единой модели по всему портфелю б/у ТС.
+Проверь, стоит ли обучать отдельные модели для каждого типа бизнеса б/у ТС
+(ПРОЛОНГАЦИЯ, Б/У ТС ПЕРЕХОД, Б/У ТС ИНОЕ) вместо общих моделей.
 
-При оценке учитывай:
-- прирост основной метрики на тестовой выборке сегмента относительно эталонной модели;
-- размер сегмента: на малых сегментах прирост может быть шумом;
-- какие правки конфигурации пришлось внести агенту и не искажают ли они сравнение;
-- если отдельная модель лучше только на части сегментов — предложи гибрид
-  (отдельные модели для крупных сегментов, общая — для остальных).
+Модели: частота (б/у ТС) и тяжесть + тоталь. Для каждой группы сравнивались комбинации:
+частота общая/групповая × тяжесть+тоталь общая/групповая, эталон — все модели общие.
 
-В рекомендации явно напиши: внедрять разделение или нет, и для каких сегментов.
+При оценке:
+- главный критерий — фин. эффект (Margin) комбинации относительно эталона на тесте группы;
+- статистические метрики отдельных моделей используй как подтверждение;
+- учитывай размер группы и премию: на малых группах прирост может быть шумом;
+- учитывай правки конфигурации, внесённые агентом, — не искажают ли они сравнение;
+- если выигрыш есть только в части групп или только для одного блока моделей — предложи гибрид.
+
+В рекомендации явно напиши: какие модели (частоту, тяжесть/тоталь) разделять и для каких групп.

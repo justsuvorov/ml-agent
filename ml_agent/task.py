@@ -1,5 +1,11 @@
 """Разбор txt-файла с заданием для агента.
 
+Блоки моделей — секции ``[block.<имя>]`` (например ``[block.frequency]``, ``[block.severity_total]``):
+каждый блок — отдельный конфиг моделей и отдельный запуск ``update_models()``. Ключи блока
+переопределяют общие ключи ``[automl]``; известные ключи (models_config, base_query, class,
+auto_ml_config, retro, hp_tune, post_hook, extra_kwargs) — настройки запуска, остальные
+(например ``model_to_compare``) передаются в конструктор automl-класса.
+
 Формат — INI-секции (key = value) + свободный текст. Всё, что идёт после заголовка
 ``[instructions]`` до конца файла, считается свободной инструкцией и передаётся в LLM
 как есть (без требований к отступам). Комментарии — строки, начинающиеся с ``#`` или ``;``.
@@ -11,6 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+DEFAULT_BLOCK = 'main'  # задание без [block.*] — один блок из [automl]
+BLOCK_KEYS = {'models_config', 'base_query', 'class', 'auto_ml_config', 'retro', 'hp_tune', 'post_hook',
+              'extra_kwargs'}
 INSTRUCTIONS_HEADER = re.compile(r'^\[instructions\]\s*$', re.IGNORECASE | re.MULTILINE)
 
 
@@ -60,6 +69,25 @@ class TaskSpec:
     llm: Dict[str, Any] = field(default_factory=dict)
     external_config: Dict[str, Any] = field(default_factory=dict)
     email: Dict[str, Any] = field(default_factory=dict)
+    blocks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def block_names(self) -> List[str]:
+        return list(self.blocks) or [DEFAULT_BLOCK]
+
+    def block_settings(self, name: str) -> Dict[str, Any]:
+        """Настройки запуска блока: ``[automl]`` + ``[block.<name>]``; extra_kwargs объединяются."""
+        block = self.blocks.get(name, {})
+        settings = {k: v for k, v in self.automl.items() if k != 'extra_kwargs'}
+        settings.update({k: v for k, v in block.items() if k in BLOCK_KEYS and k != 'extra_kwargs'})
+        settings['extra_kwargs'] = {**(self.automl.get('extra_kwargs') or {}),
+                                    **(block.get('extra_kwargs') or {}),
+                                    **{k: v for k, v in block.items() if k not in BLOCK_KEYS}}
+        if 'base_query' not in block:  # ключ блока есть, но пустой — без фильтра
+            settings['base_query'] = self.data.get('base_query')
+        if not settings.get('models_config'):
+            raise ValueError(f'Блок {name}: не задан models_config')
+        return settings
 
     @property
     def base_dir(self) -> Path:
@@ -91,7 +119,9 @@ class TaskSpec:
                 'description': self.description,
                 'data': self.data,
                 'evaluation': self.evaluation,
-                'automl': {k: v for k, v in self.automl.items() if k != 'extra_kwargs'}}
+                'automl': {k: v for k, v in self.automl.items() if k != 'extra_kwargs'},
+                'blocks': {name: {k: v for k, v in block.items() if k != 'extra_kwargs'}
+                           for name, block in self.blocks.items()}}
 
 
 def load_task(path: str) -> TaskSpec:
@@ -115,7 +145,7 @@ def load_task(path: str) -> TaskSpec:
 
     return TaskSpec(path=path,
                     name=str(task_section['name']),
-                    scenario=str(task_section.get('scenario', 'segment_split')),
+                    scenario=str(task_section.get('scenario', 'factor_split')),
                     description=str(task_section.get('description') or ''),
                     instructions=instructions,
                     data=sections.get('data', {}),
@@ -125,4 +155,5 @@ def load_task(path: str) -> TaskSpec:
                     llm=sections.get('llm', {}),
                     external_config=sections.get('external_config', {}),
                     email=sections.get('email', {}),
+                    blocks={s.split('.', 1)[1]: v for s, v in sections.items() if s.startswith('block.')},
                     )

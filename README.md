@@ -5,7 +5,9 @@
 при ошибках правит конфиг (встроенные правила + LLM) и перезапускает, сравнивает модели,
 получает выводы от LLM (JSON) и отправляет отчёт письмом.
 
-Первая задача: **стоит ли обучать отдельные модели по `BUSINESS_TYPE`**.
+Основной сценарий `factor_split`: **модели, обученные по группам одного фактора, против общих моделей**.
+Первая задача — тип бизнеса б/у ТС (ПРОЛОНГАЦИЯ, Б/У ТС ПЕРЕХОД, Б/У ТС ИНОЕ), блоки моделей —
+частота и тяжесть + тоталь, критерий — фин. эффект (`FinEffectMetric`, Margin).
 
 Как устроен casco `main_fit` и как агент с ним стыкуется — [docs/casco_main_fit.md](docs/casco_main_fit.md).
 
@@ -36,10 +38,11 @@ from ml_agent import MLAgent, setup_logging
 
 setup_logging('INFO')                       # в ячейках — только шаги агента
 agent = MLAgent('tasks/business_type_split.txt', config=config)
-agent.dry_run()                             # данные, план сегментов, колонки конфига, которых нет в данных
-report = agent.run(send_mail=False)         # обучение, сравнение, выводы LLM
+agent.dry_run()                             # группы, блоки моделей, план обучений
+report = agent.run(send_mail=False)         # обучение, комбинации, фин. эффект, выводы LLM
 report                                      # HTML-отчёт в ячейке
-report.comparison                           # таблица сравнения (DataFrame)
+report.fin_effect                           # Margin: группа × комбинация против «все общие»
+report.comparison                           # статистические метрики моделей групп против общих
 agent.send()                                # отправить письмо
 ```
 
@@ -53,10 +56,11 @@ INI-секции + свободный текст после `[instructions]` (у
 
 | Секция | Что задаёт |
 |---|---|
-| `[task]` | `name`, `scenario` (`segment_split`), `description` |
-| `[data]` | `source_file`, `preprocess_hook`, `base_query`, `segment_column`, `segment_values` (`auto` / список), `min_rows`, `group_small_segments`, `include_baseline`, `temp_dataset` |
-| `[automl]` | `class` (`casco_automl:CascoFLAutoML`), `auto_ml_config`, `models_config`, `retro`, `hp_tune`, `mlflow_experiment` (отдельный эксперимент для агента), `extra_kwargs` (JSON), `post_hook` (`casco_results`) |
-| `[evaluation]` | `main_metric`, `direction`, `min_improvement`, `compare_with` (`baseline` / `automl`), `baseline_compare_kwarg`, `compare_hook` |
+| `[task]` | `name`, `scenario` (`factor_split`), `description` |
+| `[data]` | `source_file`, `preprocess_hook`, `segment_column` (фактор), `segment_values` (группы: `auto` / список), `base_query` (область гипотезы и фильтр обучения по умолчанию), `min_rows`, `group_small_segments`, `temp_dataset` |
+| `[automl]` | общие для всех блоков: `class` (`casco_automl:CascoFLAutoML`), `auto_ml_config`, `retro`, `hp_tune`, `mlflow_experiment` (отдельный эксперимент для агента), `extra_kwargs` (JSON), `post_hook` (`casco_results`) |
+| `[block.<имя>]` | блок моделей: `models_config`, `base_query` (пусто — без фильтра), переопределения `[automl]`; прочие ключи (`model_to_compare`) — в конструктор automl-класса |
+| `[evaluation]` | фин. эффект: `business_metric` (`business_metric:FinEffectMetric`), `business_metric_kwargs`, `business_metric_key` (`Margin`), `compare_function` (`mldataworker.automl:compare_pickle_models`), `extra_columns`, `models_order`, `no_exposure_models`, `query`, `min_improvement`; стат. метрики: `main_metric`, `direction`, `baseline_compare_kwarg`; `compare_hook` |
 | `[agent]` | `workdir`, `max_fix_attempts`, `drop_missing_features`, `allow_llm_abort`, `isolate_results` |
 | `[llm]` | `model_type` — переопределить `config.llm_model_type` |
 | `[external_config]` | переопределения атрибутов `config.py` только для этого задания |
@@ -67,17 +71,21 @@ INI-секции + свободный текст после `[instructions]` (у
 
 ## Как агент сравнивает модели
 
-1. Датасет → `preprocess_hook` (`BUSINESS_TYPE_NEW → BUSINESS_TYPE`, как в `main_fit`) → `base_query` (`VEHICLE_NEW == 0`).
-2. **Единое разбиение train/test**: при `separation.kind = random` агент один раз назначает колонку
-   `AGENT_IS_TEST` на всём датасете и переводит все эксперименты на неё. Без этого тестовые строки
-   сегмента попадали бы в train исходной модели и сравнение было бы смещено в её пользу.
-3. `baseline` — исходная модель на всех данных; затем модель на каждый сегмент
-   (сегменты меньше `min_rows` — в общий `__OTHER__` или пропускаются).
-4. `compare_with = baseline`: сегментная и исходная модели оцениваются через `model_predict`
-   на **одних и тех же** тестовых строках сегмента. `compare_with = automl` — штатное сравнение
-   класса (`model_to_compare`).
-5. LLM получает сравнение, статусы, правки конфигов и инструкцию → JSON
-   `{summary, segments[{segment, model, verdict, comment}], recommendation, risks, next_steps}`.
+1. Датасет → `preprocess_hook` (`AGENT_BUSINESS_TYPE = BUSINESS_TYPE_NEW.upper()`, как в `compare_models`).
+2. **Единое разбиение train/test** на всех строках: при `separation.kind = random` агент назначает колонку
+   `AGENT_IS_TEST` и переводит на неё все обучения. Тест группы не попадает в train общей модели,
+   а частота и тяжесть видят одни и те же тестовые полисы.
+3. Для каждого блока (`[block.frequency]`, `[block.severity_total]`): общая модель на данных блока
+   (`base_query` блока) + модель на каждой группе (группы меньше `min_rows` — в `__OTHER__` или пропускаются).
+   Модель группы сравнивается с общей моделью блока на тех же строках (`model_predict`, стат. метрики).
+4. **Комбинации**: для каждой группы — все варианты «общая / групповая» по блокам
+   (2 блока → 3 комбинации + эталон «все общие»). Пиклы блоков склеиваются в порядке `models_order`
+   (частота, тяжесть, тоталь — как `CascoRelease`), у `no_exposure_models` снимается экспозиция
+   (как `CompareCascoModels`).
+5. **Фин. эффект**: `compare_pickle_models(тест группы в области base_query, комбинация, эталон,
+   FinEffectMetric())` → Margin (> 0 — комбинация лучше эталона). Сводная «группа × комбинация» + сумма по группам.
+6. LLM получает фин. эффект (главное), стат. метрики, статусы, правки конфигов и инструкцию → JSON
+   `{summary, groups[{group, best_combination, verdict, comment}], recommendation, risks, next_steps}`.
 
 ## Исправление ошибок
 
@@ -107,7 +115,8 @@ INI-секции + свободный текст после `[instructions]` (у
 |---|---|
 | `agent.py` | `MLAgent`: `dry_run()`, `run()`, `send()` |
 | `task.py` | разбор txt-задания |
-| `scenarios.py` | сценарии; `segment_split` |
+| `scenarios.py` | сценарий `factor_split`: блоки × группы |
+| `combinations.py` | комбинации моделей блоков и их оценка бизнес-метрикой |
 | `runner.py` | запуск эксперимента, перехват лога, цикл исправления, сравнение с baseline |
 | `config_editor.py` | безопасные правки JSON-конфига моделей |
 | `llm.py` | `AIModel`, `VskAIModel`, `QwenModel`, `OfflineModel`, `LLMClient` (промпт → JSON) |

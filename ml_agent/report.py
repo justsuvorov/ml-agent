@@ -10,7 +10,8 @@ from loguru import logger
 
 from ml_agent import prompts
 from ml_agent.llm import LLMClient
-from ml_agent.runner import ExperimentResult, metric_columns
+from ml_agent.combinations import summarize
+from ml_agent.runner import COMMON, ExperimentResult, metric_columns
 from ml_agent.task import TaskSpec
 from ml_agent.utils import import_object
 
@@ -49,7 +50,8 @@ def build_comparison(task: TaskSpec, experiments: List[ExperimentResult]) -> Tup
             if new is not None and ref is not None:
                 improvement = round((new - ref) if direction == 'maximize' else (ref - new), 6)
                 rel = round(100 * improvement / abs(ref), 3) if ref else None
-            rows.append({'experiment': exp.name, 'segment': exp.description, 'n_rows': exp.n_rows,
+            rows.append({'experiment': exp.name, 'block': exp.block, 'group': exp.group,
+                         'segment': exp.description, 'n_rows': exp.n_rows,
                          'model': model, 'metric': metric, 'direction': direction,
                          'reference': reference, 'new_value': new, 'reference_value': ref,
                          'improvement': improvement, 'improvement_pct': rel})
@@ -69,16 +71,24 @@ def run_compare_hook(task: TaskSpec, experiments: List[ExperimentResult]) -> Opt
         return None
 
 
+def business_key(task: TaskSpec, metric_keys: List[str]) -> Optional[str]:
+    """Основное значение бизнес-метрики (``[evaluation] business_metric_key``, по умолчанию первое — Margin)."""
+    return task.evaluation.get('business_metric_key') or (metric_keys[0] if metric_keys else None)
+
+
 def ask_conclusions(task: TaskSpec, llm: LLMClient, metric: str, comparison: List[dict],
-                    experiments: List[ExperimentResult], extra: Optional[pd.DataFrame]) -> dict:
+                    experiments: List[ExperimentResult], extra: Optional[pd.DataFrame],
+                    business: List[dict] = None, key: str = None) -> dict:
     details = [{k: v for k, v in e.to_dict().items() if k not in ('final_config',)} for e in experiments]
     if extra is not None:
         details.append({'custom_comparison': json.loads(extra.to_json(orient='records', force_ascii=False))})
+    business = [{k: v for k, v in r.items() if k != 'choice'} for r in business or []]
     prompt = prompts.report_prompt(task=task.to_prompt_dict(), instructions=task.instructions,
-                                   comparison=comparison, experiments=details)
+                                   business=business, business_key=key, comparison=comparison,
+                                   experiments=details)
     try:
         return llm.ask_json('report', prompts.SYSTEM_PROMPT, prompt,
-                            context={'comparison': comparison,
+                            context={'comparison': comparison, 'business': business, 'business_key': key,
                                      'min_improvement': task.evaluation.get('min_improvement', 0)})
     except Exception as exc:
         logger.error(f'AGENT||LLM не сформировала выводы: {exc}')
@@ -86,28 +96,49 @@ def ask_conclusions(task: TaskSpec, llm: LLMClient, metric: str, comparison: Lis
                 'risks': [], 'next_steps': []}
 
 
+def fin_effect_table(business: List[dict], key: str) -> pd.DataFrame:
+    """Группа × комбинация -> значение бизнес-метрики относительно эталона «все общие»."""
+    summary = summarize(business)
+    if summary.empty or key not in summary.columns:
+        return pd.DataFrame()
+    table = summary.pivot_table(index='group', columns='combination', values=key, aggfunc='first', sort=False)
+    table.columns.name = None
+    return table.reset_index().rename(columns={'group': 'Группа'})
+
+
 def build_sections(task: TaskSpec, metric: str, comparison: List[dict], conclusions: dict,
-                   experiments: List[ExperimentResult], extra: Optional[pd.DataFrame]) -> List[Section]:
+                   experiments: List[ExperimentResult], extra: Optional[pd.DataFrame],
+                   business: List[dict] = None, key: str = None) -> List[Section]:
     sections: List[Section] = [
         ('Задача', task.description or task.name),
         ('Вывод', conclusions.get('summary', '')),
         ('Рекомендация', conclusions.get('recommendation', '')),
     ]
-    if comparison:
-        df = pd.DataFrame(comparison)[['experiment', 'segment', 'n_rows', 'model', 'reference', 'new_value',
-                                       'reference_value', 'improvement', 'improvement_pct']]
-        df.columns = ['Эксперимент', 'Сегмент', 'Строк', 'Модель', 'Эталон', f'{metric}: новая',
-                      f'{metric}: эталон', 'Прирост', 'Прирост, %']
-        sections.append((f'Сравнение по метрике {metric} (тест, {comparison[0]["direction"]})', df))
-    if conclusions.get('segments'):
-        df = pd.DataFrame(conclusions['segments'])
+    fin_effect = fin_effect_table(business or [], key)
+    if not fin_effect.empty:
+        sections.append((f'{key}: комбинации моделей против «все общие» (тест группы; > 0 — лучше эталона)',
+                         fin_effect))
+    errors = [r for r in business or [] if 'error' in r]
+    if errors:
+        sections.append(('Комбинации, которые не удалось оценить', pd.DataFrame(errors)[
+            ['group', 'combination', 'error']]))
+    verdicts = conclusions.get('groups') or conclusions.get('segments')
+    if verdicts:
+        df = pd.DataFrame(verdicts)
         if 'verdict' in df:
             df['verdict'] = df['verdict'].map(lambda v: VERDICTS.get(v, v))
-        sections.append(('Оценка по сегментам', df))
+        sections.append(('Оценка по группам', df))
+    if comparison:
+        df = pd.DataFrame(comparison)[['block', 'group', 'n_rows', 'model', 'reference', 'new_value',
+                                       'reference_value', 'improvement', 'improvement_pct']]
+        df['group'] = df['group'].replace({COMMON: 'все данные'})
+        df.columns = ['Блок', 'Группа', 'Строк', 'Модель', 'Эталон', f'{metric}: новая',
+                      f'{metric}: эталон', 'Прирост', 'Прирост, %']
+        sections.append((f'Статистические метрики по моделям: {metric} (тест, {comparison[0]["direction"]})', df))
     if extra is not None and not extra.empty:
         sections.append(('Дополнительное сравнение', extra))
     sections.append(('Статус экспериментов', pd.DataFrame([{
-        'Эксперимент': e.name, 'Сегмент': e.description, 'Строк': e.n_rows, 'Статус': e.status,
+        'Эксперимент': e.name, 'Блок': e.block, 'Описание': e.description, 'Строк': e.n_rows, 'Статус': e.status,
         'Попыток': e.attempts, 'Правки конфига': '; '.join(e.config_changes) or '-',
         'Ошибки': ' | '.join(x.splitlines()[-1] for x in e.errors if x.strip())[:500] or '-',
         'Пикл': e.result_pickle or '-'} for e in experiments])))
@@ -141,6 +172,8 @@ class AgentReport:
     comparison: pd.DataFrame
     conclusions: dict
     experiments: List[ExperimentResult]
+    fin_effect: pd.DataFrame = field(default_factory=pd.DataFrame)  # группа × комбинация -> бизнес-метрика
+    combinations: List[dict] = field(default_factory=list)  # все оценки комбинаций (в т.ч. с ошибками)
     sections: List[Section] = field(repr=False, default_factory=list)
     run_dir: Optional[Path] = None
     email_sent: bool = False
@@ -151,7 +184,7 @@ class AgentReport:
 
     @property
     def status(self) -> pd.DataFrame:
-        return pd.DataFrame([{'experiment': e.name, 'segment': e.description, 'n_rows': e.n_rows,
+        return pd.DataFrame([{'experiment': e.name, 'block': e.block, 'group': e.group, 'n_rows': e.n_rows,
                               'status': e.status, 'attempts': e.attempts,
                               'config_changes': len(e.config_changes)} for e in self.experiments])
 
@@ -165,6 +198,8 @@ class AgentReport:
     def to_dict(self) -> dict:
         return {'task': self.task, 'metric': self.metric,
                 'comparison': self.comparison.to_dict(orient='records'),
+                'fin_effect': self.fin_effect.to_dict(orient='records'),
+                'combinations': [{k: v for k, v in r.items() if k != 'choice'} for r in self.combinations],
                 'conclusions': self.conclusions, 'experiments': [e.to_dict() for e in self.experiments],
                 'run_dir': str(self.run_dir), 'email_sent': self.email_sent}
 
@@ -176,14 +211,18 @@ class AgentReport:
         logger.info(f'AGENT||Отчёт: {run_dir / "report.html"}')
 
 
-def build_report(task: TaskSpec, llm: LLMClient, experiments: List[ExperimentResult]) -> AgentReport:
+def build_report(task: TaskSpec, llm: LLMClient, experiments: List[ExperimentResult],
+                 combinations: List[dict] = None, metric_keys: List[str] = None) -> AgentReport:
     metric, comparison = build_comparison(task, experiments)
     extra = run_compare_hook(task, experiments)
-    conclusions = ask_conclusions(task, llm, metric, comparison, experiments, extra)
+    key = business_key(task, metric_keys or [])
+    conclusions = ask_conclusions(task, llm, metric, comparison, experiments, extra, combinations, key)
     subject = task.email.get('subject') or f'ML-агент: {task.name}'
     return AgentReport(task=task.name, subject=subject, metric=metric, comparison=pd.DataFrame(comparison),
                        conclusions=conclusions, experiments=experiments,
-                       sections=build_sections(task, metric, comparison, conclusions, experiments, extra))
+                       fin_effect=fin_effect_table(combinations or [], key), combinations=combinations or [],
+                       sections=build_sections(task, metric, comparison, conclusions, experiments, extra,
+                                               combinations, key))
 
 
 def send_email(report: AgentReport, config, receivers: List[str] = None,

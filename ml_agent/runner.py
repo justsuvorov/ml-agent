@@ -19,12 +19,13 @@ from loguru import logger
 from ml_agent import prompts
 from ml_agent.config_editor import ModelsConfigEditor, PatchError
 from ml_agent.llm import LLMClient
-from ml_agent.task import TaskSpec
+from ml_agent.task import DEFAULT_BLOCK, TaskSpec
 from ml_agent.utils import import_object, round_floats
 
 NEW_TEST = 'Новая модель||Тестовая выборка'
 OLD_TEST = 'Предыдущая модель||Тестовая выборка'
 SPLIT_COLUMN = 'AGENT_IS_TEST'  # единое разбиение train/test (0/1), назначается сценарием
+COMMON = '__ALL__'  # группа «все данные» — общая модель блока
 NON_METRIC_COLUMNS = {'level_0', 'index', 'Metric group', 'Model', 'Имя модели'}
 
 
@@ -37,6 +38,8 @@ class ExperimentResult:
     name: str
     description: str
     n_rows: int
+    block: str = DEFAULT_BLOCK
+    group: str = COMMON
     status: str = 'pending'  # success | failed | skipped
     attempts: int = 0
     config_changes: List[str] = field(default_factory=list)
@@ -90,28 +93,28 @@ class ExperimentRunner:
         self.llm = llm
         self.run_dir = run_dir
         self.external_config = external_config
-        self.automl_class = import_object(task.automl.get('class', 'mldataworker.automl_manager:AutoMLManager'))
-        self.models_config = task.resolve(task.automl['models_config'])
-        self.auto_ml_config = task.resolve(task.automl['auto_ml_config'])
         self.target_columns = set()
         self.results: List[ExperimentResult] = []  # все эксперименты запуска (в т.ч. при остановке)
+        self.combinations: List[dict] = []  # оценка комбинаций моделей бизнес-метрикой (сценарий)
+        self.metric_keys: List[str] = []  # имена значений бизнес-метрики (например Margin)
 
-    def run(self, name: str, data: pd.DataFrame, description: str = '',
-            extra_kwargs: dict = None) -> ExperimentResult:
+    def run(self, name: str, data: pd.DataFrame, description: str = '', block: str = DEFAULT_BLOCK,
+            group: str = COMMON, extra_kwargs: dict = None) -> ExperimentResult:
         exp_dir = self.run_dir / name
         exp_dir.mkdir(parents=True, exist_ok=True)
-        result = ExperimentResult(name=name, description=description, n_rows=len(data))
+        result = ExperimentResult(name=name, description=description, n_rows=len(data), block=block, group=group)
         self.results.append(result)
-        logger.info(f'AGENT||Эксперимент {name}: {description}, строк {len(data)}')
+        settings = self.task.block_settings(block)
+        logger.info(f'AGENT||Эксперимент {name} [{block}]: {description}, строк {len(data)}')
 
-        editor = self._prepare_config(data, exp_dir, result)
+        editor = self._prepare_config(data, exp_dir, result, settings)
         if result.status == 'failed':
             return result
 
         for attempt in range(1, self.task.max_fix_attempts + 2):
             result.attempts = attempt
             config_path = editor.save(exp_dir / f'models_config_attempt{attempt}.json')
-            outcome = self._run_once(config_path, exp_dir, attempt, extra_kwargs or {})
+            outcome = self._run_once(config_path, exp_dir, attempt, settings, extra_kwargs or {})
             result.warnings += outcome.warnings
             if outcome.ok:
                 result.status = 'success'
@@ -136,14 +139,15 @@ class ExperimentRunner:
         return result
 
     # ---------- подготовка ----------
-    def _prepare_config(self, data: pd.DataFrame, exp_dir: Path, result: ExperimentResult) -> ModelsConfigEditor:
+    def _prepare_config(self, data: pd.DataFrame, exp_dir: Path, result: ExperimentResult,
+                        settings: dict) -> ModelsConfigEditor:
         dataset_path = exp_dir / 'dataset.parquet'
         data.to_parquet(dataset_path)
         temp_dataset = self.task.data.get('temp_dataset')
         if temp_dataset:  # совместимость со скриптами, которые читают фиксированный temp-файл
             data.to_parquet(self.task.resolve(temp_dataset))
 
-        editor = ModelsConfigEditor.from_file(self.models_config)
+        editor = ModelsConfigEditor.from_file(self.task.resolve(settings['models_config']))
         editor.data.setdefault('data_config', {})
         editor.data['data_config']['source'] = 'parquet'
         editor.data['data_config']['local_name_source'] = str(dataset_path)
@@ -174,22 +178,23 @@ class ExperimentRunner:
         return editor
 
     # ---------- запуск ----------
-    def _run_once(self, config_path: Path, exp_dir: Path, attempt: int, extra_kwargs: dict) -> _Attempt:
+    def _run_once(self, config_path: Path, exp_dir: Path, attempt: int, settings: dict,
+                  extra_kwargs: dict) -> _Attempt:
         captured: List[str] = []
         sink_errors = logger.add(lambda m: captured.append(m.record['message']), level='ERROR')
         sink_file = logger.add(exp_dir / f'attempt{attempt}.log', level='DEBUG', encoding='utf-8')
         automl, exc_text = None, None
         try:
-            kwargs = dict(self.task.automl.get('extra_kwargs') or {})
-            kwargs.update(extra_kwargs)
-            automl = self.automl_class(auto_ml_config=str(self.auto_ml_config),
-                                       models_config=str(config_path),
-                                       external_config=self.external_config,
-                                       retro=bool(self.task.automl.get('retro', False)),
-                                       hp_tune=bool(self.task.automl.get('hp_tune', False)),
-                                       **kwargs)
+            kwargs = {**settings['extra_kwargs'], **extra_kwargs}
+            automl_class = import_object(settings.get('class') or 'mldataworker.automl_manager:AutoMLManager')
+            automl = automl_class(auto_ml_config=str(self.task.resolve(settings['auto_ml_config'])),
+                                  models_config=str(config_path),
+                                  external_config=self.external_config,
+                                  retro=bool(settings.get('retro', False)),
+                                  hp_tune=bool(settings.get('hp_tune', False)),
+                                  **kwargs)
             automl.update_models(send_mail=False)
-            hook = self.task.automl.get('post_hook')
+            hook = settings.get('post_hook')
             if hook:
                 try:
                     getattr(automl, hook)()
@@ -313,6 +318,12 @@ class ExperimentRunner:
                 result.warnings.append(f'Сравнение {model_name} с baseline не удалось: {exc}')
                 logger.error(f'AGENT||Сравнение {result.name}/{model_name} с baseline: {exc}')
         self._save_result(result)
+
+    def pickle_path(self, result: Optional[ExperimentResult]) -> Optional[Path]:
+        """Пикл моделей эксперимента (list[dict_for_prod_export]) в results_path запуска."""
+        if result is None or result.status != 'success' or not result.result_pickle:
+            return None
+        return Path(self.external_config.results_path) / result.result_pickle
 
     def release(self, result: ExperimentResult):
         """Освобождает память от automl-объекта (датасеты КАСКО большие)."""

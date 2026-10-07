@@ -1,30 +1,28 @@
 """Сценарии экспериментов агента.
 
-``segment_split`` — проверка гипотезы «отдельные модели по значениям поля лучше единой»:
+``factor_split`` — гипотеза «модели, обученные отдельно по группам фактора, лучше общих»:
 
-1. ``baseline`` — обучение на всём датасете (исходная постановка);
-2. для каждого значения ``segment_column`` — датасет фильтруется и запускается та же
-   процедура ``update_models()``; модель сравнивается с эталоном на тесте того же сегмента.
+1. датасет -> ``preprocess_hook`` -> единое разбиение train/test (``AGENT_IS_TEST``) на всех строках;
+2. для каждого блока моделей (``[block.*]``: частота, тяжесть+тоталь, ...):
+   общая модель на данных блока (``base_query`` блока) + модель на каждой группе
+   ``segment_column`` (``segment_values``); каждая — ``update_models()`` с автоисправлением конфига;
+   модель группы сравнивается с общей моделью блока на тех же тестовых строках (стат. метрики);
+3. комбинации «общая / групповая» по блокам оцениваются бизнес-метрикой (фин. эффект) на тестовых
+   строках группы в области ``[data] base_query`` (см. :mod:`ml_agent.combinations`).
 
-Эталон (``[evaluation] compare_with``):
-
-* ``baseline`` (по умолчанию) — исходная модель из шага 1; агент сам оценивает её и сегментную
-  модель на одних и тех же тестовых строках сегмента (``model_predict``);
-* ``automl`` — то, с чем сравнивает сам automl-класс (prod-пикл, ``model_to_compare`` и т.п.).
-
-Дополнительно ``baseline_compare_kwarg`` передаёт путь к пиклу baseline в automl-класс
-(например ``model_to_compare`` у CascoFLAutoML), чтобы его штатное сравнение тоже шло с baseline.
+``segment_split`` — прежнее имя сценария (один блок из ``[automl]``).
 """
 import re
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 
+from ml_agent.combinations import CombinationEvaluator
 from ml_agent.config_editor import ModelsConfigEditor
-from ml_agent.runner import SPLIT_COLUMN, AgentAbort, ExperimentResult, ExperimentRunner
+from ml_agent.runner import COMMON, SPLIT_COLUMN, AgentAbort, ExperimentResult, ExperimentRunner
 from ml_agent.task import TaskSpec
 from ml_agent.utils import import_object
 
@@ -32,28 +30,33 @@ OTHER = '__OTHER__'
 
 
 def load_dataset(task: TaskSpec) -> pd.DataFrame:
+    """Датасет задания после ``preprocess_hook`` (без фильтров — они применяются по блокам)."""
     path = task.resolve(task.data['source_file'])
-    if path.suffix.lower() == '.csv':
-        df = pd.read_csv(path)
-    else:
-        df = pd.read_parquet(path)
+    df = pd.read_csv(path) if path.suffix.lower() == '.csv' else pd.read_parquet(path)
     logger.info(f'AGENT||Датасет {path}: {df.shape}')
     if task.data.get('preprocess_hook'):
         df = import_object(task.data['preprocess_hook'])(df)
-    if task.data.get('base_query'):
-        df = df.query(task.data['base_query'])
-        logger.info(f"AGENT||После base_query '{task.data['base_query']}': {df.shape}")
     return df.reset_index(drop=True)
+
+
+def apply_query(df: pd.DataFrame, query: str = None, label: str = '') -> pd.DataFrame:
+    if not query:
+        return df
+    result = df.query(query)
+    logger.info(f"AGENT||{label} '{query}': {result.shape}")
+    return result
 
 
 def assign_fixed_split(task: TaskSpec, df: pd.DataFrame) -> pd.DataFrame:
     """Назначает train/test один раз на всём датасете (колонка ``AGENT_IS_TEST``).
 
-    Иначе random-разбиение строится заново внутри каждого эксперимента, и тестовые строки
-    сегмента попадают в train исходной модели — сравнение с ней было бы завышено в её пользу.
-    Для разбиения по периоду (kind=date) ничего не делаем: оно и так одинаково во всех экспериментах.
+    Иначе random-разбиение строится заново в каждом эксперименте, тестовые строки группы попадают
+    в train общей модели, а модели разных блоков (частота, тяжесть) видят разный тест.
+    Для разбиения по периоду (kind=date) ничего не делаем: оно и так одинаково везде.
     """
-    separation = ModelsConfigEditor.from_file(task.resolve(task.automl['models_config']))         .data.get('data_config', {}).get('separation') or {}
+    first_block = task.block_settings(task.block_names[0])
+    separation = ModelsConfigEditor.from_file(task.resolve(first_block['models_config'])) \
+        .data.get('data_config', {}).get('separation') or {}
     if not task.evaluation.get('fixed_split', True) or separation.get('kind', 'random') != 'random':
         return df
     rng = np.random.RandomState(separation.get('random_state', 42))
@@ -77,55 +80,67 @@ def plan_segments(task: TaskSpec, df: pd.DataFrame) -> List[str]:
         ([OTHER] if task.data.get('group_small_segments') else [])
 
 
-def run_segment_split(task: TaskSpec, runner: ExperimentRunner) -> List[ExperimentResult]:
-    df = assign_fixed_split(task, load_dataset(task))
+def group_masks(task: TaskSpec, df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """Группа -> маска строк. Группы меньше min_rows (в области base_query) уходят в __OTHER__ или пропускаются."""
     column = task.data['segment_column']
     if column not in df.columns:
         raise AgentAbort(f'В датасете нет поля {column}')
-    min_rows = int(task.data.get('min_rows', 0))
     keys = df[column].astype(str)
+    scope = apply_query(df, task.data.get('base_query'), 'Область гипотезы')
+    scope_keys = keys.loc[scope.index]
+    min_rows = int(task.data.get('min_rows', 0))
+    values = plan_segments(task, scope)
+    small = [v for v in values if v != OTHER and (scope_keys == v).sum() < min_rows]
+    masks = {}
+    for value in values:
+        mask = keys.isin(small) if value == OTHER else keys == value
+        if value == OTHER:
+            skip = not small or mask.loc[scope.index].sum() < max(min_rows, 1)
+        else:
+            skip = value in small
+        if skip:
+            logger.info(f'AGENT||Группа {value} пропущена: мало строк')
+            continue
+        masks[value] = mask
+    return masks
+
+
+def run_factor_split(task: TaskSpec, runner: ExperimentRunner) -> List[ExperimentResult]:
+    df = assign_fixed_split(task, load_dataset(task))
+    groups = group_masks(task, df)
+    column = task.data['segment_column']
+    compare_kwarg = task.evaluation.get('baseline_compare_kwarg')
 
     results: List[ExperimentResult] = []
-    baseline = None
-    if task.data.get('include_baseline', True):
-        baseline = runner.run('baseline', df, description='Все данные, исходная постановка')
-        results.append(baseline)
+    for block in task.block_names:
+        settings = task.block_settings(block)
+        block_df = apply_query(df, settings.get('base_query'), f'Блок {block}')
+        common = runner.run(f'{block}__common', block_df.reset_index(drop=True), block=block, group=COMMON,
+                            description=f'{block}: общая модель')
+        results.append(common)
+        extra_kwargs = {}
+        if compare_kwarg and runner.pickle_path(common):
+            extra_kwargs[compare_kwarg] = str(runner.pickle_path(common))
 
-    compare_with = task.evaluation.get('compare_with', 'baseline')
-    if compare_with == 'baseline' and (baseline is None or baseline.status != 'success'):
-        raise AgentAbort('compare_with=baseline, но исходная модель не обучена — сравнивать не с чем')
-    extra_kwargs = {}
-    compare_kwarg = task.evaluation.get('baseline_compare_kwarg')
-    if compare_kwarg and baseline is not None and baseline.result_pickle:
-        extra_kwargs[compare_kwarg] = str(Path(runner.external_config.results_path) / baseline.result_pickle)
+        for group, mask in groups.items():
+            group_df = block_df.loc[mask.loc[block_df.index]].reset_index(drop=True)
+            result = runner.run(f'{block}__{_slug(group)}', group_df, block=block, group=group,
+                                description=f'{block}: {column} == {group}' if group != OTHER
+                                else f'{block}: малые группы {column} вместе',
+                                extra_kwargs=extra_kwargs)
+            runner.evaluate_vs_baseline(result, common)
+            runner.release(result)
+            results.append(result)
+        runner.release(common)
 
-    segments = plan_segments(task, df)
-    small = [v for v in segments if v != OTHER and (keys == v).sum() < min_rows]
-    for value in segments:
-        if value == OTHER:
-            mask = keys.isin(small)
-            description = f'{column} in {small} (малые сегменты вместе)'
-        else:
-            mask = keys == value
-            description = f'{column} == {value}'
-        name = f'segment_{_slug(value)}'
-        n_rows = int(mask.sum())
-        if value in small or (value == OTHER and n_rows < max(min_rows, 1)):
-            skipped = ExperimentResult(name=name, description=description, n_rows=n_rows, status='skipped',
-                                       warnings=[f'Строк {n_rows} < min_rows={min_rows}'])
-            runner.results.append(skipped)
-            results.append(skipped)
-            logger.info(f'AGENT||{name} пропущен: {n_rows} строк')
-            continue
-        result = runner.run(name, df.loc[mask].reset_index(drop=True),
-                            description=description, extra_kwargs=extra_kwargs)
-        if compare_with == 'baseline':
-            runner.evaluate_vs_baseline(result, baseline)
-        runner.release(result)
-        results.append(result)
-    if baseline is not None:
-        runner.release(baseline)
+    evaluator = CombinationEvaluator(task, runner)
+    if evaluator.enabled:
+        scope = apply_query(df, task.data.get('base_query'), 'Область оценки')
+        runner.combinations = evaluator.evaluate(scope, {g: m.loc[scope.index] for g, m in groups.items()},
+                                                 results)
+        runner.metric_keys = sorted(evaluator.metric_keys)
     return results
 
 
-SCENARIOS = {'segment_split': run_segment_split}
+SCENARIOS = {'factor_split': run_factor_split,
+             'segment_split': run_factor_split}

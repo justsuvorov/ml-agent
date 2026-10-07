@@ -27,7 +27,7 @@ from ml_agent.config_editor import ModelsConfigEditor
 from ml_agent.llm import build_llm_client
 from ml_agent.report import AgentReport, build_report, send_email
 from ml_agent.runner import AgentAbort, ExperimentRunner
-from ml_agent.scenarios import OTHER, SCENARIOS, load_dataset, plan_segments
+from ml_agent.scenarios import SCENARIOS, apply_query, group_masks, load_dataset
 from ml_agent.task import TaskSpec, load_task
 
 AGENT_LOG_PREFIXES = ('AGENT', 'LLM', 'VSK', 'Qwen')
@@ -74,22 +74,23 @@ class MLAgent:
 
     def _dry_run(self) -> dict:
         df = load_dataset(self.task)
-        editor = ModelsConfigEditor.from_file(self.task.resolve(self.task.automl['models_config']))
-        column = self.task.data['segment_column']
-        min_rows = int(self.task.data.get('min_rows', 0))
-        counts = df[column].astype(str).value_counts()
-        segments = pd.DataFrame([{'segment': v, 'n_rows': int(counts.get(v, 0))}
-                                 for v in plan_segments(self.task, df) if v != OTHER])
-        if not segments.empty:
-            small = segments['n_rows'] < min_rows
-            segments['action'] = 'обучить'
-            segments.loc[small, 'action'] = 'в __OTHER__' if self.task.data.get('group_small_segments') \
-                else 'пропустить'
-        missing = sorted(editor.referenced_columns() - set(df.columns))
-        result = {'rows': len(df), 'models': editor.model_names(), 'n_features': len(editor.feature_names()),
-                  'missing_columns': missing, 'segments': segments}
-        logger.info(f"AGENT||dry-run: строк {len(df)}, модели {result['models']}, "
-                    f"нет в данных: {missing or 'нет'}")
+        groups = group_masks(self.task, df)
+        blocks, plan = [], []
+        for block in self.task.block_names:
+            settings = self.task.block_settings(block)
+            editor = ModelsConfigEditor.from_file(self.task.resolve(settings['models_config']))
+            block_df = apply_query(df, settings.get('base_query'), f'Блок {block}')
+            missing = sorted(editor.referenced_columns() - set(df.columns))
+            blocks.append({'block': block, 'models': editor.model_names(), 'rows': len(block_df),
+                           'base_query': settings.get('base_query') or '-', 'missing_columns': missing})
+            plan.append({'block': block, 'group': 'все данные', 'n_rows': len(block_df)})
+            plan += [{'block': block, 'group': g, 'n_rows': int(m.loc[block_df.index].sum())}
+                     for g, m in groups.items()]
+        n_combinations = (2 ** len(blocks) - 1) * len(groups)
+        result = {'rows': len(df), 'groups': list(groups), 'blocks': pd.DataFrame(blocks),
+                  'plan': pd.DataFrame(plan), 'n_trainings': len(plan), 'n_combinations': n_combinations}
+        logger.info(f"AGENT||dry-run: строк {len(df)}, группы {list(groups)}, обучений {len(plan)}, "
+                    f"комбинаций для оценки {n_combinations}")
         return result
 
     # ---------- запуск ----------
@@ -118,7 +119,7 @@ class MLAgent:
             if not runner.results:
                 raise AgentAbort('Ни одного эксперимента не выполнено — см. agent.log')
 
-            self.report = build_report(self.task, llm, runner.results)
+            self.report = build_report(self.task, llm, runner.results, runner.combinations, runner.metric_keys)
             if self.task.email.get('send', False) if send_mail is None else send_mail:
                 try:
                     send_email(self.report, run_config, receivers=self.task.email_receivers,
