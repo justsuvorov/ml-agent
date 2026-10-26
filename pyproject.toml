@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ml-agent"
 version = "0.1.0"
 description = "Agent that trains, releases and monitors outboxml models from Russian prompts"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "outboxml==1.0.0",
     "pydantic==2.12.4",
@@ -31,7 +31,7 @@ timeout = 120
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["ALL"]
