@@ -1,7 +1,7 @@
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Protocol, final
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 
 class Tool(Protocol):
@@ -14,3 +14,11 @@ class Tool(Protocol):
 
 class ToolError(Exception):
     """Failure of a tool that the language model can fix by changing its call."""
+
+
+@final
+class ArgumentsError(ToolError):
+    """Arguments of a tool call that do not match the schema of the tool."""
+
+    def __init__(self, error: ValidationError) -> None:
+        super().__init__(f"Arguments do not match the schema of the tool: {error}")

@@ -1,11 +1,13 @@
 import json
 import secrets
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Final, final, override
 
 from pydantic import JsonValue
 
 from ml_agent.llm import Llm
+from ml_agent.outbox import Outbox
 from ml_agent.tool import Tool
 
 
@@ -63,3 +65,17 @@ class Echo(Tool):
     @override
     def run(self, arguments: Mapping[str, JsonValue]) -> str:
         return json.dumps(dict(arguments), ensure_ascii=False)
+
+
+@final
+class Board(Outbox):
+    """Library stub that reports prepared metrics for any config."""
+
+    __slots__ = ("_metrics",)
+
+    def __init__(self, metrics: Mapping[str, Mapping[str, Mapping[str, float]]]) -> None:
+        self._metrics: Final = metrics
+
+    @override
+    def metrics(self, config: Path) -> Mapping[str, Mapping[str, Mapping[str, float]]]:
+        return self._metrics
