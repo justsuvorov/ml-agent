@@ -4,7 +4,7 @@ from typing import Final, final, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
-from ml_agent.outbox import Outbox
+from ml_agent.outbox import Training
 from ml_agent.tool import ArgumentsError, Tool
 from ml_agent.workspace import Workspace
 
@@ -25,7 +25,7 @@ class Fitting(Tool):
 
     __slots__ = ("_outbox", "_workspace")
 
-    def __init__(self, workspace: Workspace, outbox: Outbox) -> None:
+    def __init__(self, workspace: Workspace, outbox: Training) -> None:
         self._workspace: Final = workspace
         self._outbox: Final = outbox
 

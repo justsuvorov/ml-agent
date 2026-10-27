@@ -17,6 +17,7 @@ dev = [
     "pytest",
     "pytest-timeout",
     "PyHamcrest",
+    "pandas-stubs",
     "ruff",
     "mypy",
 ]

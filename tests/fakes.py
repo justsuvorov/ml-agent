@@ -7,7 +7,7 @@ from typing import Final, final, override
 from pydantic import JsonValue
 
 from ml_agent.llm import Llm
-from ml_agent.outbox import Outbox
+from ml_agent.outbox import Dataset, Datasets, Models, Training
 from ml_agent.tool import Tool
 
 
@@ -68,7 +68,7 @@ class Echo(Tool):
 
 
 @final
-class Board(Outbox):
+class Board(Training):
     """Library stub that reports prepared metrics for any config."""
 
     __slots__ = ("_metrics",)
@@ -79,3 +79,40 @@ class Board(Outbox):
     @override
     def metrics(self, config: Path) -> Mapping[str, Mapping[str, Mapping[str, float]]]:
         return self._metrics
+
+
+@final
+class Shelf(Models, Datasets):
+    """Library stub with one model of prepared features and one dataset of prepared columns."""
+
+    __slots__ = ("_columns", "_features")
+
+    def __init__(self, features: Mapping[str, str], columns: frozenset[str]) -> None:
+        self._features: Final = features
+        self._columns: Final = columns
+
+    @override
+    def features(self, config: Path, model: str) -> Mapping[str, str]:
+        return self._features
+
+    @override
+    def dataset(self, config: Path) -> Dataset:
+        return Frame(self._columns)
+
+
+@final
+class Frame(Dataset):
+    """Dataset stub that names the candidates it was asked to select from."""
+
+    __slots__ = ("_columns",)
+
+    def __init__(self, columns: frozenset[str]) -> None:
+        self._columns: Final = columns
+
+    @override
+    def columns(self) -> frozenset[str]:
+        return self._columns
+
+    @override
+    def selection(self, automl: Path, model: str, candidates: tuple[str, ...]) -> str:
+        return "".join(f"<selected {candidate}>" for candidate in candidates)

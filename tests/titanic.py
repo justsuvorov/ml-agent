@@ -18,8 +18,8 @@ class Titanic:
         self._names: Final = names
 
     def config(self) -> Path:
-        (self._root / "data").mkdir(parents=True)
-        (self._root / "configs").mkdir()
+        (self._root / "data").mkdir(parents=True, exist_ok=True)
+        (self._root / "configs").mkdir(exist_ok=True)
         with (
             self._example("data/titanic.csv").open(encoding="utf-8", newline="") as source,
             (self._root / "data/titanic.csv").open("w", encoding="utf-8", newline="") as target,
@@ -50,6 +50,13 @@ class Titanic:
             encoding="utf-8",
         )
         return self._root / "configs/titanic.json"
+
+    def automl(self) -> Path:
+        (self._root / "configs").mkdir(exist_ok=True)
+        (self._root / "configs/automl.json").write_bytes(
+            self._example("configs/automl-titanic.json").read_bytes(),
+        )
+        return self._root / "configs/automl.json"
 
     def _example(self, name: str) -> Path:
         return Path(outboxml.__file__).parents[1] / "examples/titanic" / name
