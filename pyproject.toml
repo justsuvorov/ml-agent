@@ -36,6 +36,7 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
+    "CPY001",
     "D100",
     "D102",
     "D103",
