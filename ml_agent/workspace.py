@@ -9,6 +9,8 @@ class Workspace(Protocol):
 
     def file(self, name: str) -> Path: ...
 
+    def place(self, name: str) -> Path: ...
+
 
 @final
 class Folder(Workspace):
@@ -25,6 +27,13 @@ class Folder(Workspace):
             raise OutsideFileError(name)
         if not (self._root / name).is_file():
             raise MissingFileError(name)
+        return (self._root / name).resolve()
+
+    @override
+    def place(self, name: str) -> Path:
+        if not (self._root / name).resolve().is_relative_to(self._root.resolve()):
+            raise OutsideFileError(name)
+        (self._root / name).resolve().parent.mkdir(parents=True, exist_ok=True)
         return (self._root / name).resolve()
 
 

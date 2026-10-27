@@ -107,3 +107,21 @@ def test_refuses_a_call_without_features(tmp_path: Path) -> None:
         raises(ArgumentsError),
         "Check did not refuse the call without features",
     )
+
+
+def test_saves_the_config_copy_next_to_the_config(tmp_path: Path) -> None:
+    model = name()
+    (tmp_path / "models.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "automl.json").write_text("{}", encoding="utf-8")
+    assert_that(
+        FeatureCheck(Folder(tmp_path), Shelf({}, frozenset({"new"}))).run(
+            {
+                "models_config": "models.json",
+                "automl_config": "automl.json",
+                "model": model,
+                "features": ["new"],
+            },
+        ),
+        contains_string(f"<target {(tmp_path / f'models_{model}_features.json').resolve()}>"),
+        "Check did not save the config copy next to the config",
+    )

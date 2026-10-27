@@ -114,5 +114,13 @@ class Frame(Dataset):
         return self._columns
 
     @override
-    def selection(self, automl: Path, model: str, candidates: tuple[str, ...]) -> str:
-        return "".join(f"<selected {candidate}>" for candidate in candidates)
+    def selection(
+        self,
+        automl: Path,
+        model: str,
+        candidates: tuple[str, ...],
+        target: Path,
+    ) -> str:
+        return "".join(
+            (*(f"<selected {candidate}>" for candidate in candidates), f"<target {target}>"),
+        )

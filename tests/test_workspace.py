@@ -33,3 +33,21 @@ def test_refuses_a_missing_file(tmp_path: Path) -> None:
         raises(MissingFileError),
         "Folder did not refuse the missing file",
     )
+
+
+def test_places_a_new_file_inside_the_folder(tmp_path: Path) -> None:
+    file = f"{name()}/{name()}.json"
+    assert_that(
+        Folder(tmp_path).place(file),
+        equal_to((tmp_path / file).resolve()),
+        "Folder did not place the new file inside it",
+    )
+
+
+def test_refuses_to_place_a_file_outside_the_folder(tmp_path: Path) -> None:
+    (tmp_path / "inner").mkdir()
+    assert_that(
+        lambda: Folder(tmp_path / "inner").place(f"../{name()}.json"),
+        raises(OutsideFileError),
+        "Folder did not refuse to place the file outside it",
+    )

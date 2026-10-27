@@ -39,7 +39,13 @@ class Dataset(Protocol):
 
     def columns(self) -> frozenset[str]: ...
 
-    def selection(self, automl: Path, model: str, candidates: tuple[str, ...]) -> str: ...
+    def selection(
+        self,
+        automl: Path,
+        model: str,
+        candidates: tuple[str, ...],
+        target: Path,
+    ) -> str: ...
 
 
 class Datasets(Protocol):
@@ -92,6 +98,7 @@ class LocalOutbox(Training, Library):
     def dataset(self, config: Path) -> Dataset:
         models = AllModelsConfig.model_validate(RootedConfig(config, self._root).content())
         return OutboxDataset(
+            config,
             models,
             BaseExtractor(data_config=models.data_config).extract_dataset(),
             self._environment(),
@@ -111,14 +118,16 @@ class LocalOutbox(Training, Library):
 class OutboxDataset(Dataset):
     """Dataset loaded by outboxml for a models config, kept in memory between processes."""
 
-    __slots__ = ("_environment", "_frame", "_models")
+    __slots__ = ("_environment", "_frame", "_models", "_source")
 
     def __init__(
         self,
+        source: Path,
         models: AllModelsConfig,
         frame: pd.DataFrame,
         environment: SimpleNamespace,
     ) -> None:
+        self._source: Final = source
         self._models: Final = models
         self._frame: Final = frame
         self._environment: Final = environment
@@ -128,7 +137,13 @@ class OutboxDataset(Dataset):
         return frozenset(str(column) for column in self._frame.columns)
 
     @override
-    def selection(self, automl: Path, model: str, candidates: tuple[str, ...]) -> str:
+    def selection(
+        self,
+        automl: Path,
+        model: str,
+        candidates: tuple[str, ...],
+        target: Path,
+    ) -> str:
         config = NamedModel(self._models, model).config()
         settings = AutoMLConfig.model_validate_json(automl.read_text(encoding="utf-8"))
         columns = [
@@ -162,6 +177,20 @@ class OutboxDataset(Dataset):
         selection.select_features(model_name=model, params=settings.feature_selection.params)
         if interface.last is None:
             raise SelectionFailureError(model)
+        chosen = tuple(
+            feature
+            for feature in preparation.get_model_config().features
+            if feature.name in selection.result_features
+        )
+        if chosen:
+            target.write_text(
+                json.dumps(
+                    ExtendedConfig(self._source, model, chosen).content(),
+                    ensure_ascii=False,
+                    indent=4,
+                ),
+                encoding="utf-8",
+            )
         return "\n".join(
             (
                 (
@@ -173,12 +202,13 @@ class OutboxDataset(Dataset):
                     selection.types_dict,
                     interface.last,
                     interface.to_drop,
-                    tuple(
-                        feature
-                        for feature in preparation.get_model_config().features
-                        if feature.name in selection.result_features
-                    ),
+                    chosen,
                 ).text(),
+                (
+                    f"Копия конфига моделей с выбранными фичами модели {model} сохранена: {target}"
+                    if chosen
+                    else "Копия конфига не сохранена: ни одна фича не выбрана."
+                ),
             ),
         )
 
@@ -318,6 +348,41 @@ class UsedColumns:
                 ),
             ),
         )
+
+
+@final
+class ExtendedConfig:
+    """Models config of outboxml as written on disk, with extra features added to one model."""
+
+    __slots__ = ("_features", "_model", "_source")
+
+    def __init__(self, source: Path, model: str, features: tuple[FeatureModelConfig, ...]) -> None:
+        self._source: Final = source
+        self._model: Final = model
+        self._features: Final = features
+
+    def content(self) -> dict[str, Any]:
+        return {
+            **(origin := json.loads(self._source.read_text(encoding="utf-8"))),
+            "models_configs": [
+                {
+                    **model,
+                    "features": [
+                        *model["features"],
+                        *(
+                            to_jsonable_python(
+                                feature.model_dump(exclude_none=True, exclude={"bins", "mapping"}),
+                                fallback=str,
+                            )
+                            for feature in self._features
+                        ),
+                    ],
+                }
+                if model["name"] == self._model
+                else model
+                for model in origin["models_configs"]
+            ],
+        }
 
 
 @final

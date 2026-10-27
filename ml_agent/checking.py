@@ -1,5 +1,6 @@
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Final, final, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
@@ -39,7 +40,8 @@ class FeatureCheck(Tool):
             "запускает отбор фич outboxml (feature selection) только для новых фич, которые "
             "есть в датасете. Датасет обрезается до колонок конфига и проверяемых фич. "
             "Возвращает параметры фич, уже включённых в модель, фичи, которых нет в датасете, "
-            "тип каждого кандидата, топ по SHAP, итог отбора и группировки выбранных фич.\n"
+            "тип каждого кандидата, топ по SHAP, итог отбора и группировки выбранных фич. "
+            "Если фичи выбраны, сохраняет копию конфига моделей с ними и называет её путь.\n"
             f"Аргументы: {json.dumps(CheckRequest.model_json_schema(), ensure_ascii=False)}"
         )
 
@@ -74,6 +76,13 @@ class FeatureCheck(Tool):
                     self._workspace.file(request.automl_config),
                     request.model,
                     candidates,
+                    self._workspace.place(
+                        str(
+                            Path(request.models_config).with_name(
+                                f"{Path(request.models_config).stem}_{request.model}_features.json",
+                            ),
+                        ),
+                    ),
                 )
                 if candidates
                 else "Отбор не запускался: ни одной новой фичи нет в датасете.",
