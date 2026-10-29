@@ -1,9 +1,13 @@
 import json
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Thread
 from typing import Final, final, override
+from wsgiref.simple_server import WSGIRequestHandler, make_server
+from wsgiref.types import StartResponse, WSGIEnvironment
 
 from joblib.parallel import ThreadingBackend
 from pydantic import JsonValue
@@ -134,3 +138,52 @@ def refusal() -> ThreadingBackend:
     backend = ThreadingBackend()
     backend.submit = refuse
     return backend
+
+
+@contextmanager
+def completion(
+    reply: Callable[[Mapping[str, str], Mapping[str, JsonValue]], str],
+) -> Iterator[str]:
+    def application(environ: WSGIEnvironment, start: StartResponse) -> list[bytes]:
+        content = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": reply(
+                                {
+                                    key.removeprefix("HTTP_").replace("_", "-").title(): value
+                                    for key, value in environ.items()
+                                    if key.startswith("HTTP_")
+                                },
+                                json.loads(
+                                    environ["wsgi.input"].read(int(environ["CONTENT_LENGTH"])),
+                                ),
+                            ),
+                        },
+                    },
+                ],
+            },
+        ).encode()
+        start(
+            "200 OK",
+            [("Content-Type", "application/json"), ("Content-Length", str(len(content)))],
+        )
+        return [content]
+    server = make_server("127.0.0.1", 0, application, handler_class=Silence)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@final
+class Silence(WSGIRequestHandler):
+    """Request handler of the chat service fake that keeps the test output clean."""
+
+    @override
+    def log_message(self, *args: object) -> None:
+        return

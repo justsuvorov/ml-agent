@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "outboxml==1.0.1",
     "pydantic==2.12.4",
+    "requests",
 ]
 
 [project.optional-dependencies]
@@ -18,6 +19,7 @@ dev = [
     "pytest-timeout",
     "PyHamcrest",
     "pandas-stubs",
+    "types-requests",
     "ruff",
     "mypy",
 ]
