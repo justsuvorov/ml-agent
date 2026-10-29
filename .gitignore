@@ -7,3 +7,5 @@ __pycache__/
 *.egg-info/
 catboost_info/
 .ipynb_checkpoints/
+examples/*/results/
+examples/*/configs/*_features.json
