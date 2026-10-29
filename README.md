@@ -11,7 +11,7 @@ JSON-конфигами, которые агент читает, проверя�
 
 ```
 python -m venv .venv
-.venv/Scripts/python -m pip install -e D:/Projects/outboxml -e .[dev]
+.venv/Scripts/python -m pip install -e .[dev]
 .venv/Scripts/pytest
 .venv/Scripts/ruff check .
 .venv/Scripts/mypy ml_agent tests

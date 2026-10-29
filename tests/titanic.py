@@ -4,12 +4,10 @@ import secrets
 from pathlib import Path
 from typing import Final, final
 
-import outboxml
-
 
 @final
 class Titanic:
-    """Workspace with the Titanic example of outboxml whose two models carry the given names."""
+    """Workspace with the outboxml 1.0.1 Titanic example whose two models carry the given names."""
 
     __slots__ = ("_names", "_root")
 
@@ -21,7 +19,7 @@ class Titanic:
         (self._root / "data").mkdir(parents=True, exist_ok=True)
         (self._root / "configs").mkdir(exist_ok=True)
         with (
-            self._example("data/titanic.csv").open(encoding="utf-8", newline="") as source,
+            self._example("titanic.csv").open(encoding="utf-8", newline="") as source,
             (self._root / "data/titanic.csv").open("w", encoding="utf-8", newline="") as target,
         ):
             reader = csv.DictReader(source)
@@ -31,7 +29,7 @@ class Titanic:
                 {**row, "ROW_WEIGHT": 0.5 + secrets.randbelow(1000) / 1000} for row in reader
             )
         example = json.loads(
-            self._example("configs/config-example-titanic.json").read_text(encoding="utf-8"),
+            self._example("config-example-titanic.json").read_text(encoding="utf-8"),
         )
         (self._root / "configs/titanic.json").write_text(
             json.dumps(
@@ -54,12 +52,12 @@ class Titanic:
     def automl(self) -> Path:
         (self._root / "configs").mkdir(exist_ok=True)
         (self._root / "configs/automl.json").write_bytes(
-            self._example("configs/automl-titanic.json").read_bytes(),
+            self._example("automl-titanic.json").read_bytes(),
         )
         return self._root / "configs/automl.json"
 
     def _example(self, name: str) -> Path:
-        return Path(outboxml.__file__).parents[1] / "examples/titanic" / name
+        return Path(__file__).parent / "resources/titanic" / name
 
 
 def name() -> str:
