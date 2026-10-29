@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 
 from hamcrest import assert_that, contains_string, equal_to, has_item, has_key, raises
+from joblib import parallel_config, register_parallel_backend
 from outboxml.core.pydantic_models import FeatureModelConfig
 
 from ml_agent.outbox import FeatureText, LocalOutbox, UnknownModelError
+from tests.fakes import refusal
 from tests.titanic import Titanic, name
 
 
@@ -186,4 +188,21 @@ def test_selection_saves_no_copy_when_nothing_is_selected(tmp_path: Path) -> Non
         [path.name for path in tmp_path.iterdir()].count("copy.json"),
         equal_to(0),
         "Selection saved a config copy although nothing was selected",
+    )
+
+
+def test_selection_ignores_the_parallel_backend_of_the_caller(tmp_path: Path) -> None:
+    first = name()
+    titanic = Titanic(tmp_path, (first, name()))
+    register_parallel_backend("refusal", refusal)
+    with parallel_config(backend="refusal"):
+        text = (
+            LocalOutbox(tmp_path)
+            .dataset(titanic.config())
+            .selection(titanic.automl(), first, ("EMBARKED",), tmp_path / "copy.json")
+        )
+    assert_that(
+        text,
+        contains_string("стабильности: нет; выбрана: да."),
+        "Selection depended on the parallel backend of the caller",
     )

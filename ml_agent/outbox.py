@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, Final, Protocol, final, override
 
 import pandas as pd
+from joblib import parallel_config
 from outboxml.core.enums import FeatureEngineering, FeatureTypesForSelection
 from outboxml.core.prepared_datasets import FeatureSelectionPrepareDataset, PrepareDataset
 from outboxml.core.pydantic_models import (
@@ -180,7 +181,8 @@ class OutboxDataset(Dataset):
             prepare_data_interface=FeatureSelectionPrepareDataset(model_config=config),
             feature_selection_interface=interface,
         )
-        selection.select_features(model_name=model, params=settings.feature_selection.params)
+        with parallel_config(backend="threading"):
+            selection.select_features(model_name=model, params=settings.feature_selection.params)
         if interface.last is None:
             raise SelectionFailureError(model)
         chosen = tuple(

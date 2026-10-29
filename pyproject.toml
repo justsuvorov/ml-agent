@@ -55,5 +55,5 @@ ignore = [
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["outboxml.*"]
+module = ["outboxml.*", "joblib.*"]
 ignore_missing_imports = true

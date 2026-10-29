@@ -1,9 +1,11 @@
 import json
 import secrets
 from collections.abc import Mapping
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Final, final, override
 
+from joblib.parallel import ThreadingBackend
 from pydantic import JsonValue
 
 from ml_agent.llm import Llm
@@ -124,3 +126,11 @@ class Frame(Dataset):
         return "".join(
             (*(f"<selected {candidate}>" for candidate in candidates), f"<target {target}>"),
         )
+
+
+def refusal() -> ThreadingBackend:
+    def refuse(*_: object, **__: object) -> None:
+        raise BrokenProcessPool
+    backend = ThreadingBackend()
+    backend.submit = refuse
+    return backend
