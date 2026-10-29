@@ -1,5 +1,6 @@
 import json
 from collections.abc import Collection, Mapping
+from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Final, Protocol, final, override
@@ -15,7 +16,7 @@ from outboxml.core.pydantic_models import (
 )
 from outboxml.data_subsets import DataPreprocessor
 from outboxml.datasets_manager import DataSetsManager
-from outboxml.extractors import BaseExtractor
+from outboxml.extractors import BaseExtractor, get_useful_columns
 from outboxml.feature_selection import BaseFS, FeatureSelectionInterface
 from pydantic_core import to_jsonable_python
 
@@ -105,7 +106,6 @@ class LocalOutbox(Training, Library):
         )
 
     def _environment(self) -> SimpleNamespace:
-        (self._root / "results").mkdir(exist_ok=True)
         return SimpleNamespace(
             results_path=self._root / "results",
             prod_models_path=self._root / "prod",
@@ -149,7 +149,13 @@ class OutboxDataset(Dataset):
         columns = [
             column
             for column in self._frame.columns
-            if column in UsedColumns(self._models, candidates).names()
+            if column
+            in {
+                *candidates,
+                *chain.from_iterable(
+                    get_useful_columns(self._models.data_config, self._models.models_configs),
+                ),
+            }
         ]
         preparation = PrepareDataset(
             model_config=config,
@@ -312,42 +318,6 @@ class NamedModel:
             if model.name == self._name:
                 return model
         raise UnknownModelError(self._name, tuple(m.name for m in self._models.models_configs))
-
-
-@final
-class UsedColumns:
-    """Columns of a dataset that the models of a config and the candidate features need."""
-
-    __slots__ = ("_candidates", "_models")
-
-    def __init__(self, models: AllModelsConfig, candidates: tuple[str, ...]) -> None:
-        self._models: Final = models
-        self._candidates: Final = candidates
-
-    def names(self) -> frozenset[str]:
-        return frozenset(
-            (
-                *self._candidates,
-                *(self._models.data_config.extra_columns or ()),
-                *(self._models.data_config.separation.period_column or ()),
-                *(
-                    column
-                    for model in self._models.models_configs
-                    for column in (
-                        *(feature.name for feature in model.features),
-                        *(
-                            part
-                            for relative in model.relative_features or ()
-                            for part in (relative.numerator, relative.denominator)
-                        ),
-                        model.column_target,
-                        model.column_exposure,
-                        model.column_weight,
-                    )
-                    if column
-                ),
-            ),
-        )
 
 
 @final
