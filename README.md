@@ -74,6 +74,8 @@ agent.answer("Обучи модели из конфига configs/titanic.json �
 Схема аргументов каждого инструмента — pydantic-модель. Её JSON Schema попадает в инструкцию
 для модели, а аргументы, которые прислала модель, проверяются по этой схеме.
 
+Как добавить свой инструмент — в руководстве [docs/creating_tools.md](docs/creating_tools.md).
+
 ### check_features
 
 Аргументы: `models_config` и `automl_config` (пути к конфигам), `model` (имя модели),
